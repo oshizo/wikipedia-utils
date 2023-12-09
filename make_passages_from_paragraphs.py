@@ -20,115 +20,99 @@ from tqdm import tqdm
 
 from sentence_splitters import MeCabSentenceSplitter
 
+import re
+def split_section(text, splitter, max_nchar=750):
+    # textを、max_ncharにおおむね収まる、互いに長さが近い複数のチャンクに分割する
+
+    total_nchar = len(text)
+    if total_nchar <= max_nchar:
+        return [text]
+
+    # チャンク数を見積もる
+    nchunk = max(1, round(total_nchar / max_nchar) )
+    nchar_chunk = total_nchar/nchunk
+
+    # チャンク当たりの文字数がmax_ncharを超えないようにチャンクを増やす
+    while True:
+        if nchar_chunk > max_nchar:
+            nchunk += 1
+            nchar_chunk = total_nchar/nchunk
+        else:
+            break
+
+    nchar = 0  # section内の文字数を数える
+    chunk_id = 1
+    sentences = []
+
+    # 文の分割
+    for line in re.split(r'\n+', text):
+        sentences += splitter(line)
+        if len(sentences) > 0:
+            sentences[-1] = sentences[-1] + "\n"
+
+    chunks = []
+    chunk_text = ""
+    for sentence in sentences:
+        l = len(sentence)
+        
+        # チャンク内の文字数が、チャンク番号xチャンク文字数をある程度以上超えそうな場合は次に行く
+        if nchar + l//2 >= nchar_chunk*(chunk_id):
+            if chunk_id != nchunk:
+                chunk_id += 1
+                chunks.append(chunk_text.strip())
+                chunk_text = ""
+            else:
+                # 最終チャンクはmax_charを超えてもそこに詰める
+                pass
+
+        nchar += l
+        chunk_text += sentence
+        
+    if chunk_text != "":
+        chunks.append(chunk_text.strip())
+    
+    return chunks
 
 def generate_passages(
     paragraphs_file: str,
-    passage_unit: str,
-    passage_boundary: str,
-    append_title_to_passage_text: bool,
     max_passage_length: int,
-    as_long_as_possible: bool,
     sentence_splitter: Optional[Callable] = None
 ):
-    assert passage_unit in ("section", "paragraph", "sentence")
-    assert passage_boundary in ("title", "section", "paragraph")
-
-    passage_id = 0
-    last_pageid = None
-    last_revid = None
-    last_title = None
-    last_section = None
-    section_text = ""
-    unit_texts = []
-
-    def generate_passage_texts(unit_texts):
-        if as_long_as_possible:
-            buffer_text = ""
-            for unit_text in unit_texts:
-                assert len(unit_text) <= max_passage_length
-                if len(buffer_text) + len(unit_text) > max_passage_length:
-                    yield buffer_text
-                    buffer_text = ""
-
-                buffer_text += unit_text
-            else:
-                if len(buffer_text) > 0:
-                    yield buffer_text
-        else:
-            for unit_text in unit_texts:
-                assert len(unit_text) <= max_passage_length
-                yield unit_text
-
+    
     with gzip.open(paragraphs_file, "rt") as f:
-        for line in f:
-            paragraph_item = json.loads(line)
-            pageid = paragraph_item["pageid"]
-            revid = paragraph_item["revid"]
-            title = paragraph_item["title"]
-            section = paragraph_item["section"]
-            paragraph_text = paragraph_item["text"]
+        data = []
+        for line in f.readlines():
+            data.append(json.loads(line))
 
-            if (title != last_title) or \
-               (passage_boundary == "paragraph") or \
-               (passage_boundary == "section" and section != last_section):
-                for passage_text in generate_passage_texts(unit_texts):
-                    passage_id += 1
-                    if append_title_to_passage_text:
-                        passage_text = last_title + args.title_passage_boundary + passage_text
+        passage_id = 0
+        section_rows = []
+        lastrow = data[0]
 
-                    assert last_pageid is not None
-                    assert last_revid is not None
-                    assert last_title is not None
-                    assert last_section is not None
-                    output_item = {
-                        "id": passage_id,
-                        "pageid": last_pageid,
-                        "revid": last_revid,
-                        "title": last_title,
-                        "section": last_section,
-                        "text": passage_text,
-                    }
+        for row in tqdm(data):
+            title = row["title"]
+            section = row["section"]
+
+            # titleまたはsectionが変わった場合、そこまでのデータを出力する
+            if title != lastrow["title"] or section != lastrow["section"]:
+
+                section_text = "\n".join([r["text"] for r in section_rows])
+                for chunk in split_section(section_text, sentence_splitter, max_passage_length):
+                    output_item = json.dumps(
+                        {
+                            "id": passage_id,
+                            "pageid": lastrow["pageid"],
+                            "revid": lastrow["revid"],
+                            "title": lastrow["title"],
+                            "section": lastrow["section"],
+                            "text": chunk
+                        }, ensure_ascii=False)
                     yield output_item
 
-                unit_texts = []
+                    passage_id += 1
+                section_rows = []
 
-            if passage_unit == "section":
-                if section != last_section and len(section_text) > 0:
-                    if len(section_text) <= max_passage_length:
-                        unit_texts.append(section_text)
-
-                    section_text = ""
-
-                section_text += paragraph_text
-            elif passage_unit == "paragraph":
-                if len(paragraph_text) <= max_passage_length:
-                    unit_texts.append(paragraph_text)
-            elif passage_unit == "sentence":
-                unit_texts += [sent for sent in sentence_splitter(paragraph_text) if len(sent) <= max_passage_length]
-
-            last_pageid = pageid
-            last_revid = revid
-            last_title = title
-            last_section = section
-        else:
-            for passage_text in generate_passage_texts(unit_texts):
-                passage_id += 1
-                if append_title_to_passage_text:
-                    passage_text = last_title + passage_text
-
-                assert last_pageid is not None
-                assert last_revid is not None
-                assert last_title is not None
-                assert last_section is not None
-                output_item = {
-                    "id": passage_id,
-                    "pageid": last_pageid,
-                    "revid": last_revid,
-                    "title": last_title,
-                    "section": last_section,
-                    "text": passage_text,
-                }
-                yield output_item
+            section_rows.append(row)
+            lastrow = row
 
 
 def main(args: argparse.Namespace):
@@ -137,11 +121,7 @@ def main(args: argparse.Namespace):
     with gzip.open(args.output_file, "wt") as fo:
         passage_generator = generate_passages(
             paragraphs_file=args.paragraphs_file,
-            passage_unit=args.passage_unit,
-            passage_boundary=args.passage_boundary,
-            append_title_to_passage_text=args.append_title_to_passage_text,
             max_passage_length=args.max_passage_length,
-            as_long_as_possible=args.as_long_as_possible,
             sentence_splitter=sentence_splitter
         )
         for passage_item in tqdm(passage_generator):
@@ -152,14 +132,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--paragraphs_file", type=str, required=True)
     parser.add_argument("--output_file", type=str, required=True)
-    parser.add_argument("--passage_unit", type=str, default="paragraph")
-    parser.add_argument("--passage_boundary", type=str, required="section")
-    parser.add_argument("--append_title_to_passage_text", action="store_true")
-    parser.add_argument("--title_passage_boundary", type=str, default=" ")
-    parser.add_argument("--max_passage_length", type=int, default=1000,
+    parser.add_argument("--max_passage_length", type=int, default=750,
         help="It does not take page title lengths into account even if the "
              "--append_title_to_passage_text option is enabled")
-    parser.add_argument("--as_long_as_possible", action="store_true")
     parser.add_argument("--mecab_option", type=str)
     args = parser.parse_args()
     main(args)
