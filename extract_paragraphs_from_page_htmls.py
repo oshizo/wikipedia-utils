@@ -23,7 +23,8 @@ from tqdm import tqdm
 
 DEFAULT_SECTIONS_TO_IGNORE = ["脚注", "出典", "参考文献", "関連項目", "外部リンク"]
 DEFAULT_TAGS_TO_REMOVE = ["table"]
-DEFAULT_TAGS_TO_EXTRACT = ["p"]
+# DEFAULT_TAGS_TO_EXTRACT = ["p"]
+DEFAULT_TAGS_TO_EXTRACT = ["p", "h3", "h4", "h5", "h6", "dt", "dd", "li", "th", "tr"]
 DEFAULT_INNER_TAGS_TO_REMOVE = ["sup"]
 
 
@@ -37,21 +38,55 @@ def normalize_text(text):
 
 def extract_paragraphs_from_html(html, tags_to_extract, tags_to_remove, inner_tags_to_remove):
     soup = BeautifulSoup(html, features="lxml")
-    section_title = "__LEAD__"
+    h2 = None
+    h3 = None
+    h4 = None
+    dt = None
+
     section = soup.find(["section"])
     while section:
         if section.h2 is not None:
-            section_title = section.h2.text
+            h2 = section.h2.text
+            h3 = None
+            h4 = None
+            dt = None
 
         for tag in section.find_all(tags_to_remove):
             tag.clear()
 
-        for tag in section.find_all(tags_to_extract):
+        tags = section.find_all(tags_to_extract)
+        for tag in tags:
+
+            # これらのタグの配下の場合、先に親要素のテキストが取得されているためスキップする
+            skip = False
+            for parent_tag in ["dd", "li", "th", "tr"]:
+                if tag.find_parent(parent_tag):
+                    skip = True
+                    break
+            if skip:
+                continue
+
             for inner_tag in tag.find_all(inner_tags_to_remove):
                 inner_tag.clear()
 
+            # h3→h4→dtの順序の階層を前提に、上位の階層が変化したら下位の階層をリセットする
+            if tag.name == "h3":
+                h3 = tag.text
+                h4 = None
+                dt = None
+                continue
+
+            if tag.name == "h4":
+                h4 = tag.text
+                dt = None
+                continue
+
+            if tag.name == "dt":
+                dt = tag.text
+                continue
+
             paragraph_text = normalize_text(tag.text)
-            yield (section_title, paragraph_text, tag.name)
+            yield ([h2, h3, h4, dt], paragraph_text, tag.name)
 
         section = section.find_next_sibling(["section"])
 
@@ -92,14 +127,25 @@ def main(args):
 
             paragraph_index = 0
             for item in extract_paragraphs_from_html(html, tags_to_extract, tags_to_remove, inner_tags_to_remove):
-                section_title, paragraph_text, tag_name = item
+                sections, paragraph_text, tag_name = item
 
-                if section_title in sections_to_ignore:
+                if sections[0] in sections_to_ignore:
                     continue
                 if len(paragraph_text) < args.min_paragraph_length:
                     continue
                 if len(paragraph_text) > args.max_paragraph_length:
                     continue
+
+                sections_dict = {}
+                if sections[0] is not None:
+                    sections_dict["h2"] = sections[0]
+                if sections[1] is not None:
+                    sections_dict["h3"] = sections[1]
+                if sections[2] is not None:
+                    sections_dict["h4"] = sections[2]
+                if sections[3] is not None:
+                    sections_dict["dt"] = sections[3]
+
 
                 output_item = {
                     "id": "{}-{}-{}".format(page_id, rev_id, paragraph_index),
@@ -107,7 +153,7 @@ def main(args):
                     "revid": rev_id,
                     "paragraph_index": paragraph_index,
                     "title": title,
-                    "section": section_title,
+                    "section": sections_dict,
                     "text": paragraph_text,
                     "html_tag": tag_name,
                 }
